@@ -1,0 +1,151 @@
+# CI for user-service. ArgoCD is the CD half: this workflow never touches the cluster.
+# Its last job only records the new image tag in the GitOps repo (microservice-monorepo), committing it to main.
+#
+# Pull request into main:
+#   1. sast   Semgrep scans the repository; any finding fails the run.
+#   2. image  Build the image (the Dockerfile test stage runs `npm test`) and scan it with Trivy; fixable
+#             HIGH/CRITICAL findings fail the run. Nothing is pushed.
+#
+# Push to main (after a merge) that changes the app/image files:
+#   1. sast, 2. image  same gates as above, then push the exact image that was scanned to GHCR, tagged with the
+#                      7-character commit SHA (never `latest`).
+#   3. update-manifest Commit the tag to apps/user-service/deployment.yaml on microservice-monorepo main (the job
+#                      bypasses that repo's pull-request ruleset). ArgoCD then syncs it: that is the deploy.
+#                      It only runs if sast and image passed.
+#
+# Every gate is a hard gate (no continue-on-error, no `|| true`): a failing scan means a red run in the history.
+#
+# Needs one repository secret, MONOREPO_TOKEN: a fine-grained PAT limited to reynaldiekoz98/microservice-monorepo with
+# "Contents: read and write". The repo's ruleset lists the Admin role as a bypass actor so this push is allowed
+# (see README). GITHUB_TOKEN cannot reach another repo.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths: [index.js, package.json, 'src/**', Dockerfile]
+
+permissions:
+  contents: read
+
+# PRs: a newer push cancels the older run. Pushes to main queue up so no image/bump is skipped.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SEMGREP_IMAGE: semgrep/semgrep:1.185.0
+  TRIVY_IMAGE: aquasec/trivy:0.76.2
+  SERVICE: user-service
+  MONOREPO: reynaldiekoz98/microservice-monorepo
+
+jobs:
+  sast:
+    name: 1. Scan the code (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      # Hard gate. One rule is switched off on purpose: "mutable action tag", because actions are referenced by
+      # version tag; pinning to commit SHAs is stricter and the better choice in production.
+      - name: Semgrep (javascript, nodejs, dockerfile, github-actions, secrets rule packs)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" \
+            semgrep scan \
+              --config p/javascript --config p/nodejs --config p/dockerfile --config p/github-actions --config p/secrets \
+              --exclude-rule yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag \
+              --metrics=off --error .
+
+  image:
+    name: 2. Build, scan (Trivy)${{ github.event_name == 'push' && ' and push the image' || '' }}
+    needs: [sast]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write   # used only by the push step, which runs after the Trivy gate
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Work out the image name and tag
+        id: vars
+        run: |
+          set -euo pipefail
+          tag="$(git rev-parse --short=7 HEAD)"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_REF=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${SERVICE}:${tag}" >> "$GITHUB_ENV"
+
+      # The Dockerfile's first stage runs `npm test`, so failing tests fail this step.
+      - name: Build the image (runs the tests)
+        run: |
+          set -euo pipefail
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            -t "$IMAGE_REF" .
+
+      # Gate: fixable HIGH and CRITICAL vulnerabilities fail the run.
+      - name: Trivy (fails on fixable HIGH/CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" \
+            image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$IMAGE_REF"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the image that was just scanned
+        if: github.event_name == 'push'
+        run: docker push "$IMAGE_REF"
+
+  update-manifest:
+    name: 3. Update the manifest on microservice-monorepo
+    needs: [image]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # Fine-grained PAT (Contents: write on microservice-monorepo only). It acts as the repo admin, who is on that
+      # repo's ruleset bypass list, so this job can push to main directly.
+      - name: Checkout microservice-monorepo
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ env.MONOREPO }}
+          token: ${{ secrets.MONOREPO_TOKEN }}
+          ref: main
+
+      - name: Set the new image tag and push to main
+        env:
+          TAG: ${{ needs.image.outputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          file="apps/${SERVICE}/deployment.yaml"
+          sed -i -E "s|(image: ghcr.io/[^/]+/${SERVICE}:)[A-Za-z0-9._-]+|\1${TAG}|" "$file"
+          grep -q "image: ghcr.io/.*/${SERVICE}:${TAG}$" "$file"
+          if git diff --quiet; then echo "Manifest already uses ${TAG}; nothing to do."; exit 0; fi
+          git config user.name "reynaldiekoz-actions[bot]"
+          git config user.email "reynaldiekoz-github-actions[bot]@users.noreply.github.com"
+          git commit -am "ci: update ${SERVICE} image tag to ${TAG}" \
+            -m "Built from https://github.com/${GITHUB_REPOSITORY}/commit/${SOURCE_SHA}"
+          # Another service's bump may have landed meanwhile: rebase and retry once.
+          git push origin HEAD:main || { git pull --rebase origin main && git push origin HEAD:main; }
