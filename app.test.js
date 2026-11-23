@@ -7,6 +7,7 @@ test('user-service CRUD', async (t) => {
   const call = (m, p, b) => fetch(base + p, { method: m, body: b && JSON.stringify(b) });
 
   assert.strictEqual((await call('GET', '/health')).status, 200);
+  assert.strictEqual((await (await call('GET', '/version')).json()).version, 'dev');
   assert.strictEqual((await (await call('GET', '/users/1')).json()).name, 'Alice');
   assert.strictEqual((await call('GET', '/users/99')).status, 404);
 
