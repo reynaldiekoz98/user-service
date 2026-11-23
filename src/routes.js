@@ -8,7 +8,9 @@ module.exports = (router, store) => {
     return user;
   };
 
-  router.get('/health', ({ send }) => send(200, { status: 'ok', service: 'user-service' }));
+  const version = process.env.APP_VERSION || 'dev';   // git SHA baked into the image (same as the image tag)
+  router.get('/health', ({ send }) => send(200, { status: 'ok', service: 'user-service', version }));
+  router.get('/version', ({ send }) => send(200, { service: 'user-service', version }));
   router.get('/users', ({ send }) => send(200, store.list()));
   router.post('/users', async ({ json, send }) => send(201, store.create(parseUser(await json()))));
   router.get('/users/:id', ctx => ctx.send(200, find(ctx)));
